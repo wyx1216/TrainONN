@@ -77,24 +77,36 @@ def mzi_mesh(global_phi, parallel=8):
     return matrix_mesh
 
 
-class SimMZIMitrix(torch.nn.Module):  # 假设你继承自 nn.Module
+class SimMZIMitrix(torch.nn.Module, MZIMatrix):
     def __init__(self, layer_num, parallel):
         super().__init__()
         self.layer_num = layer_num
         self.parallel = parallel
+        parameter_shape = (layer_num, parallel)
+        num_phase_shifters = math.prod(parameter_shape)
 
-        # 【关键2】：使用 register_buffer。这些张量会保存在模块的状态字典中，
-        # 且调用 self.cuda() 或 self.to(device) 时，它们会自动转移到对应设备。
-        self.register_buffer("global_phi", torch.randn((layer_num, parallel), dtype=torch.float32))
+        # 电压到相位的标定参数；默认保持原有的 phi = V + c 模型。
+        self.register_buffer("shifter_a", torch.zeros(parameter_shape, dtype=torch.float32))
+        self.register_buffer("shifter_b", torch.ones(parameter_shape, dtype=torch.float32))
+        self.register_buffer("shifter_c", torch.randn(parameter_shape, dtype=torch.float32))
+        self.register_buffer("voltage", torch.zeros(parameter_shape, dtype=torch.float32))
 
-        # 将字典拆解为 buffer，原代码的 update 里面漏加了 c，我在这里修复了
-        self.register_buffer("shifter_a", torch.zeros((layer_num, parallel), dtype=torch.float32))
-        self.register_buffer("shifter_b", torch.ones((layer_num, parallel), dtype=torch.float32))
-        self.register_buffer("shifter_c", torch.randn((layer_num, parallel), dtype=torch.float32))
+        # 默认值不引入新的非理想性，以保持原有仿真行为。
+        self.register_buffer("fabrication_phase_error", torch.zeros(parameter_shape, dtype=torch.float32))
+        self.register_buffer("heater_resistance", torch.ones(parameter_shape, dtype=torch.float32))
+        self.register_buffer("crosstalk_matrix", torch.zeros((num_phase_shifters, num_phase_shifters), dtype=torch.float32))
+        self.register_buffer("temperature", torch.tensor(25.0, dtype=torch.float32))
+        self.register_buffer("reference_temperature", torch.tensor(25.0, dtype=torch.float32))
+        self.register_buffer("temperature_coefficient", torch.zeros(parameter_shape, dtype=torch.float32))
+        self.register_buffer("drift_phase", torch.zeros(parameter_shape, dtype=torch.float32))
+        self.register_buffer("drift_std", torch.zeros(parameter_shape, dtype=torch.float32))
+        self.register_buffer("drift_time_constant", torch.tensor(60.0, dtype=torch.float32))
+        self.register_buffer("power_transmission", torch.tensor(1.0, dtype=torch.float32))
 
-        # 初始矩阵，不需要 registered，可以在 forward 中动态确保它在正确设备上
-        self.mesh_matrix = mzi_mesh(self.global_phi)
+        self.register_buffer("global_phi", torch.zeros(parameter_shape, dtype=torch.float32))
+        self.mesh_matrix = torch.eye(parallel, dtype=torch.complex64)
         self.nonlinear = nn.Identity()# F.sigmoid
+        self.update_voltage(torch.zeros(parameter_shape, dtype=torch.float32), dt=0.0)
 
     def step(self, x):
         return self.forward(x)
@@ -110,18 +122,106 @@ class SimMZIMitrix(torch.nn.Module):  # 假设你继承自 nn.Module
         detected = (x @ self.mesh_matrix).abs().square().float()
         return self.nonlinear(detected)
 
-    def update_voltage(self, v_diff):
-        v_diff = v_diff.view(self.layer_num, self.parallel)
-        assert len(v_diff.shape) == 2, "v_diff shape wrong! Damn"
+    @torch.no_grad()
+    def _evolve_drift(self, dt):
+        """按 Ornstein-Uhlenbeck 过程推进慢相位漂移。"""
+        dt = float(dt)
+        if dt < 0:
+            raise ValueError("dt 必须非负")
+        if dt == 0:
+            return
+        tau = self.drift_time_constant.clamp_min(torch.finfo(torch.float32).eps)
+        rho = torch.exp(-torch.as_tensor(dt, device=self.global_phi.device) / tau)
+        innovation = self.drift_std * torch.sqrt((1 - rho.square()).clamp_min(0))
+        self.drift_phase.mul_(rho).add_(innovation * torch.randn_like(self.drift_phase))
 
-        # 因为全都是 buffer，它们天然就在同一个 device 上
-        updated_phase = (self.shifter_a * v_diff ** 2 +
-                         self.shifter_b * v_diff +
-                         self.shifter_c)  # 补充了 + self.shifter_c
+    @torch.no_grad()
+    def _refresh_physics(self):
+        power = self.voltage.square() / self.heater_resistance.clamp_min(torch.finfo(torch.float32).eps)
+        phase_crosstalk = (power.reshape(-1) @ self.crosstalk_matrix.T).view_as(power)
+        phase_temperature = self.temperature_coefficient * (self.temperature - self.reference_temperature)
+        phase = (self.shifter_a * self.voltage.square() + self.shifter_b * self.voltage + self.shifter_c +
+                 self.fabrication_phase_error + phase_crosstalk + phase_temperature + self.drift_phase)
+        self.global_phi.copy_(phase)
+        self.mesh_matrix = mzi_mesh(self.global_phi) * self.power_transmission.sqrt()
 
-        # 覆盖 global_phi，使用无梯度 in-place 更新
-        self.global_phi.copy_(updated_phase)
-        self.mesh_matrix = mzi_mesh(self.global_phi)
+    @torch.no_grad()
+    def update_voltage(self, v_diff, dt=1.0):
+        voltage = v_diff.to(self.global_phi.device, dtype=self.global_phi.dtype).view(self.layer_num, self.parallel)
+        self.voltage.copy_(voltage)
+        self._evolve_drift(dt)
+        self._refresh_physics()
+
+    @torch.no_grad()
+    def hardware_miss_alignment(self, eps):
+        """生成固定制造失准相位，eps 的单位为弧度标准差。"""
+        eps = torch.as_tensor(eps, dtype=self.global_phi.dtype, device=self.global_phi.device)
+        self.fabrication_phase_error.copy_(torch.randn_like(self.fabrication_phase_error) * eps)
+        self._refresh_physics()
+
+    @torch.no_grad()
+    def set_crosstalk_matrix(self, crosstalk_matrix):
+        """设置 C[受扰通道, 加热通道]，单位为弧度每功率单位。"""
+        matrix = torch.as_tensor(
+            crosstalk_matrix, dtype=self.crosstalk_matrix.dtype, device=self.crosstalk_matrix.device
+        )
+        if matrix.shape != self.crosstalk_matrix.shape:
+            raise ValueError(f"crosstalk_matrix 的形状必须为 {tuple(self.crosstalk_matrix.shape)}")
+        self.crosstalk_matrix.copy_(matrix)
+        self._refresh_physics()
+
+    @torch.no_grad()
+    def set_temperature_coefficient(self, coefficient):
+        """设置温度相移系数，可传入标量或每个相移器的系数。"""
+        coefficient = torch.as_tensor(
+            coefficient, dtype=self.temperature_coefficient.dtype, device=self.temperature_coefficient.device
+        )
+        try:
+            coefficient = torch.broadcast_to(coefficient, self.temperature_coefficient.shape)
+        except RuntimeError as exc:
+            raise ValueError(f"coefficient 必须可广播到 {tuple(self.temperature_coefficient.shape)}") from exc
+        self.temperature_coefficient.copy_(coefficient)
+        self._refresh_physics()
+
+    @torch.no_grad()
+    def configure_drift(self, std, time_constant=None):
+        """设置 OU 漂移的稳态标准差及可选相关时间。"""
+        std = torch.as_tensor(std, dtype=self.drift_std.dtype, device=self.drift_std.device)
+        try:
+            std = torch.broadcast_to(std, self.drift_std.shape)
+        except RuntimeError as exc:
+            raise ValueError(f"std 必须可广播到 {tuple(self.drift_std.shape)}") from exc
+        if bool(torch.any(std < 0).item()):
+            raise ValueError("漂移标准差必须非负")
+        self.drift_std.copy_(std)
+        if time_constant is not None:
+            time_constant = torch.as_tensor(
+                time_constant, dtype=self.drift_time_constant.dtype, device=self.drift_time_constant.device
+            )
+            if time_constant.numel() != 1 or bool((time_constant <= 0).item()):
+                raise ValueError("漂移相关时间必须为正标量")
+            self.drift_time_constant.copy_(time_constant)
+
+    @torch.no_grad()
+    def temperature_shift(self, T):
+        """设置封装绝对温度，单位须与参考温度一致。"""
+        self.temperature.copy_(torch.as_tensor(T, dtype=self.temperature.dtype, device=self.temperature.device))
+        self._refresh_physics()
+
+    @torch.no_grad()
+    def power_loss(self, power_loss):
+        """设置总功率损耗比例；0.2 表示输出功率损失 20%。"""
+        loss = torch.as_tensor(power_loss, dtype=self.power_transmission.dtype, device=self.power_transmission.device)
+        if loss.numel() != 1 or bool(torch.any((loss < 0) | (loss >= 1)).item()):
+            raise ValueError("power_loss 必须是区间 [0, 1) 内的标量")
+        self.power_transmission.copy_(1 - loss)
+        self._refresh_physics()
+
+    @torch.no_grad()
+    def advance_time(self, dt):
+        """在电压不变时仅推进慢漂移。"""
+        self._evolve_drift(dt)
+        self._refresh_physics()
 # class RLEnv:
 #     def __init__(self):
 #         ...
@@ -130,7 +230,7 @@ class SimMZIMitrix(torch.nn.Module):  # 假设你继承自 nn.Module
 #         y_theta=self.mzi.forward(x)
 #         obs=y_theta
 #         return obs
-class TiledMZIMatrix(nn.Module):
+class TiledMZIMatrix(nn.Module, MZIMatrix):
     def __init__(self, in_features, out_features, layer_num, parallel=8, device="cuda:0"):
         super().__init__()
         self.in_features = in_features
@@ -146,12 +246,30 @@ class TiledMZIMatrix(nn.Module):
 
         param_shape = (self.in_blocks, self.out_blocks, layer_num, parallel)
         mzi_property_shape = (layer_num, parallel)
+        num_phase_shifters_per_tile = layer_num * parallel
 
         # 1. 注册基础物理参数 buffer
         self.register_buffer("global_phi", torch.randn(param_shape, dtype=torch.float32))
         self.register_buffer("shifter_a", torch.zeros(mzi_property_shape, dtype=torch.float32))
         self.register_buffer("shifter_b", torch.ones(mzi_property_shape, dtype=torch.float32))
         self.register_buffer("shifter_c", torch.randn(mzi_property_shape, dtype=torch.float32))
+        self.register_buffer("voltage", torch.zeros(param_shape, dtype=torch.float32))
+
+        # 各非理想性均作为 buffer 保存，默认值不改变原始理想仿真。
+        # 串扰仅在单个 8x8 tile 内建模，避免无物理依据的全局稠密矩阵。
+        self.register_buffer("fabrication_phase_error", torch.zeros(param_shape, dtype=torch.float32))
+        self.register_buffer("heater_resistance", torch.ones(param_shape, dtype=torch.float32))
+        self.register_buffer(
+            "crosstalk_matrix",
+            torch.zeros((num_phase_shifters_per_tile, num_phase_shifters_per_tile), dtype=torch.float32),
+        )
+        self.register_buffer("temperature", torch.tensor(25.0, dtype=torch.float32))
+        self.register_buffer("reference_temperature", torch.tensor(25.0, dtype=torch.float32))
+        self.register_buffer("temperature_coefficient", torch.zeros(param_shape, dtype=torch.float32))
+        self.register_buffer("drift_phase", torch.zeros(param_shape, dtype=torch.float32))
+        self.register_buffer("drift_std", torch.zeros(param_shape, dtype=torch.float32))
+        self.register_buffer("drift_time_constant", torch.tensor(60.0, dtype=torch.float32))
+        self.register_buffer("power_transmission", torch.ones((self.in_blocks, self.out_blocks), dtype=torch.float32))
 
         # 【修复1】：将 mesh_matrices 也注册为 buffer！让它归 PyTorch 管。
         mesh_shape = (self.in_blocks, self.out_blocks, self.parallel, self.parallel)
@@ -161,32 +279,124 @@ class TiledMZIMatrix(nn.Module):
 
         # 初始化动作 (注意：此时依然在 CPU 上，等会会被 .to 转移)
         initial_action = torch.zeros(math.prod(param_shape), dtype=torch.float32)
-        self.update_voltage(initial_action)
+        self.update_voltage(initial_action, dt=0.0)
 
 
 
-    def update_voltage(self, v_diff):
-        v_diff = v_diff.to(self.shifter_a.device)
-        v_diff = v_diff.view(self.in_blocks, self.out_blocks, self.layer_num, self.parallel)
+    @torch.no_grad()
+    def _evolve_drift(self, dt):
+        """按 Ornstein-Uhlenbeck 过程推进慢相位漂移。"""
+        dt = float(dt)
+        if dt < 0:
+            raise ValueError("dt 必须非负")
+        if dt == 0:
+            return
+        tau = self.drift_time_constant.clamp_min(torch.finfo(torch.float32).eps)
+        rho = torch.exp(-torch.as_tensor(dt, device=self.global_phi.device) / tau)
+        innovation = self.drift_std * torch.sqrt((1 - rho.square()).clamp_min(0))
+        self.drift_phase.mul_(rho).add_(innovation * torch.randn_like(self.drift_phase))
 
-        updated_phase = (self.shifter_a * v_diff ** 2 +
-                         self.shifter_b * v_diff +
-                         self.shifter_c)
-        self.global_phi.copy_(updated_phase)
+    @torch.no_grad()
+    def _refresh_physics(self):
+        """根据电压与全部物理状态重建 MZI 网格。"""
+        power = self.voltage.square() / self.heater_resistance.clamp_min(torch.finfo(torch.float32).eps)
+        power_flat = power.view(-1, self.layer_num * self.parallel)
+        phase_crosstalk = (power_flat @ self.crosstalk_matrix.T).view_as(power)
+        phase_temperature = self.temperature_coefficient * (self.temperature - self.reference_temperature)
+        phase = (self.shifter_a * self.voltage.square() + self.shifter_b * self.voltage + self.shifter_c +
+                 self.fabrication_phase_error + phase_crosstalk + phase_temperature + self.drift_phase)
+        self.global_phi.copy_(phase)
 
-        # 【核心优化】：将 in_blocks 和 out_blocks 合并为一个批次维度
         phi_flat = self.global_phi.view(self.in_blocks * self.out_blocks, self.layer_num, self.parallel)
-
-        # 使用 vmap 将针对单个 tile 的 mzi_mesh 转化为支持 batch 的函数
-        # in_dims=0 表示沿着 phi_flat 的第 0 维度（即 tile_batch 维）并行计算
-        batched_mzi_mesh = vmap(mzi_mesh, in_dims=0)
-
-        # 一次性算出所有的 8x8 矩阵！
-        matrices_flat = batched_mzi_mesh(phi_flat)
-
-        # 重新 reshape 回 4D 张量并安全更新 buffer
+        matrices_flat = vmap(mzi_mesh, in_dims=0)(phi_flat)
         matrices = matrices_flat.view(self.in_blocks, self.out_blocks, self.parallel, self.parallel)
-        self.mesh_matrices.copy_(matrices)
+        amplitude_transmission = self.power_transmission.sqrt().unsqueeze(-1).unsqueeze(-1)
+        self.mesh_matrices.copy_(matrices * amplitude_transmission)
+
+    @torch.no_grad()
+    def update_voltage(self, v_diff, dt=1.0):
+        voltage = v_diff.to(self.global_phi.device, dtype=self.global_phi.dtype)
+        voltage = voltage.view(self.in_blocks, self.out_blocks, self.layer_num, self.parallel)
+        self.voltage.copy_(voltage)
+        self._evolve_drift(dt)
+        self._refresh_physics()
+
+    @torch.no_grad()
+    def hardware_miss_alignment(self, eps):
+        """生成固定制造失准相位，eps 的单位为弧度标准差。"""
+        eps = torch.as_tensor(eps, dtype=self.global_phi.dtype, device=self.global_phi.device)
+        self.fabrication_phase_error.copy_(torch.randn_like(self.fabrication_phase_error) * eps)
+        self._refresh_physics()
+
+    @torch.no_grad()
+    def set_crosstalk_matrix(self, crosstalk_matrix):
+        """设置 tile 内 C[受扰通道, 加热通道]，单位为弧度每功率单位。"""
+        matrix = torch.as_tensor(
+            crosstalk_matrix, dtype=self.crosstalk_matrix.dtype, device=self.crosstalk_matrix.device
+        )
+        if matrix.shape != self.crosstalk_matrix.shape:
+            raise ValueError(f"crosstalk_matrix 的形状必须为 {tuple(self.crosstalk_matrix.shape)}")
+        self.crosstalk_matrix.copy_(matrix)
+        self._refresh_physics()
+
+    @torch.no_grad()
+    def set_temperature_coefficient(self, coefficient):
+        """设置温度相移系数，可传入标量或每个相移器的系数。"""
+        coefficient = torch.as_tensor(
+            coefficient, dtype=self.temperature_coefficient.dtype, device=self.temperature_coefficient.device
+        )
+        try:
+            coefficient = torch.broadcast_to(coefficient, self.temperature_coefficient.shape)
+        except RuntimeError as exc:
+            raise ValueError(f"coefficient 必须可广播到 {tuple(self.temperature_coefficient.shape)}") from exc
+        self.temperature_coefficient.copy_(coefficient)
+        self._refresh_physics()
+
+    @torch.no_grad()
+    def configure_drift(self, std, time_constant=None):
+        """设置 OU 漂移的稳态标准差及可选相关时间。"""
+        std = torch.as_tensor(std, dtype=self.drift_std.dtype, device=self.drift_std.device)
+        try:
+            std = torch.broadcast_to(std, self.drift_std.shape)
+        except RuntimeError as exc:
+            raise ValueError(f"std 必须可广播到 {tuple(self.drift_std.shape)}") from exc
+        if bool(torch.any(std < 0).item()):
+            raise ValueError("漂移标准差必须非负")
+        self.drift_std.copy_(std)
+        if time_constant is not None:
+            time_constant = torch.as_tensor(
+                time_constant, dtype=self.drift_time_constant.dtype, device=self.drift_time_constant.device
+            )
+            if time_constant.numel() != 1 or bool((time_constant <= 0).item()):
+                raise ValueError("漂移相关时间必须为正标量")
+            self.drift_time_constant.copy_(time_constant)
+
+    @torch.no_grad()
+    def temperature_shift(self, T):
+        """设置封装绝对温度，单位须与参考温度一致。"""
+        self.temperature.copy_(torch.as_tensor(T, dtype=self.temperature.dtype, device=self.temperature.device))
+        self._refresh_physics()
+
+    @torch.no_grad()
+    def power_loss(self, power_loss):
+        """设置每个 tile 的功率损耗比例；标量会自动广播。"""
+        loss = torch.as_tensor(power_loss, dtype=self.power_transmission.dtype, device=self.power_transmission.device)
+        if bool(torch.any((loss < 0) | (loss >= 1)).item()):
+            raise ValueError("power_loss 元素必须位于区间 [0, 1)")
+        try:
+            loss = torch.broadcast_to(loss, self.power_transmission.shape)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"power_loss 必须为标量或可广播到 {tuple(self.power_transmission.shape)}"
+            ) from exc
+        self.power_transmission.copy_(1 - loss)
+        self._refresh_physics()
+
+    @torch.no_grad()
+    def advance_time(self, dt):
+        """在电压不变时仅推进慢漂移。"""
+        self._evolve_drift(dt)
+        self._refresh_physics()
 
     def forward(self, x):
         batch_size = x.size(0)
