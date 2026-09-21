@@ -34,7 +34,7 @@ def get_simple_data(n_samples=1000,n_features=8):
 
 if __name__ == '__main__':
 
-    logger=MLFlowLogger(tracking_uri='sqlite:///D:/TrainONN-RL-w-o-NN/TrainONN-RL-w-o-NN/mlflow.db',
+    logger=MLFlowLogger(tracking_uri='sqlite:///D:/TrainONN-RL-w-o-NN/TrainONN-RL-w-o-NN/mlflow_new.db',
                         experiment_name = "PPOFixedMZI",
                         run_name="CE 直给; tiled; mnist; "
     )
@@ -53,7 +53,14 @@ if __name__ == '__main__':
     val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False, num_workers=4)
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=4)
 
-    trainer=Trainer(max_epochs=20,logger=logger,check_val_every_n_epoch=1)
+    trainer = Trainer(
+        max_epochs=20,
+        logger=logger,
+        check_val_every_n_epoch=1,
+        enable_progress_bar=True,
+        log_every_n_steps=1,
+    )
+    #trainer=Trainer(max_epochs=20,logger=logger,check_val_every_n_epoch=1)
     # N = 40960
     # size = 8
     # X,y=get_simple_data(n_samples=N, n_features=size)
@@ -75,3 +82,4 @@ if __name__ == '__main__':
     simple_nn=SimpleModel()
     trainer.fit(ppo_agent, train_loader, val_loader)
     trainer.test(ppo_agent, dataloaders=test_loader)
+    #& "D:\PycharmProjects\pythonProject\.venv\Scripts\python.exe" .\train.py
